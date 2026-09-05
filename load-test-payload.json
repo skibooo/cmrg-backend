@@ -1,0 +1,9 @@
+﻿{
+  "form_id": 9,
+  "gps_lat": 4.8156,
+  "gps_lng": 7.0498,
+  "answers": [
+    { "question_key": "test_question", "answer_value": "load test answer" }
+  ],
+  "media": []
+}
