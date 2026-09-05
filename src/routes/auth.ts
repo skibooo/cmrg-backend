@@ -1,205 +1,288 @@
-import { Router } from 'express';
-import bcrypt from 'bcrypt';
-import jwt from 'jsonwebtoken';
-import crypto from 'crypto';
-import { Resend } from 'resend';
-import rateLimit from 'express-rate-limit';
-import { pool } from '../db';
-
-const router = Router();
-const resend = new Resend(process.env.RESEND_API_KEY);
-
-const loginLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 10, // limit each IP to 10 login attempts per window
-  message: { error: 'Too many login attempts. Please try again in 15 minutes.' },
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-
-router.post('/register', async (req, res) => {
-  try {
-    const { name, email, password, role, org_id } = req.body;
-    const password_hash = await bcrypt.hash(password, 10);
-    const result = await pool.query(
-      'INSERT INTO users (org_id, name, email, password_hash, role) VALUES ($1, $2, $3, $4, $5) RETURNING id, name, email, role',
-      [org_id, name, email, password_hash, role]
-    );
-    res.json(result.rows[0]);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Registration failed' });
-  }
-});
-
-router.post('/login', loginLimiter as any, async (req, res) => {
-  try {
-    const email = (req.body.email || '').trim().toLowerCase();
-    const password = req.body.password || '';
-
-    const result = await pool.query('SELECT * FROM users WHERE LOWER(email) = $1', [email]);
-    const user = result.rows[0];
-    if (!user) return res.status(401).json({ error: 'Invalid credentials' });
-
-    const valid = await bcrypt.compare(password, user.password_hash);
-    if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
-
-    const token = jwt.sign(
-      { id: user.id, role: user.role, org_id: user.org_id },
-      process.env.JWT_SECRET as string,
-      { expiresIn: '7d' }
-    );
-    res.json({ token, user: { id: user.id, name: user.name, email: user.email, role: user.role } });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Login failed' });
-  }
-});
-
-router.post('/forgot-password', loginLimiter as any, async (req, res) => {
-  try {
-    const email = (req.body.email || '').trim().toLowerCase();
-    if (!email) return res.status(400).json({ error: 'Email is required' });
-
-    const result = await pool.query('SELECT * FROM users WHERE LOWER(email) = $1', [email]);
-    const user = result.rows[0];
-
-    // Always respond the same way whether or not the account exists —
-    // this prevents someone from using this endpoint to check which
-    // emails are registered in the system.
-    if (!user) {
-      return res.json({ message: 'A reset link has been sent to your email.' });
-    }
-
-    const token = crypto.randomBytes(32).toString('hex');
-    const expires = new Date(Date.now() + 60 * 60 * 1000); // 1 hour from now
-
-    await pool.query(
-      'UPDATE users SET reset_token = $1, reset_token_expires = $2 WHERE id = $3',
-      [token, expires, user.id]
-    );
-
-    const resetUrl = `${process.env.FRONTEND_URL}/reset-password?token=${token}`;
-
-    await resend.emails.send({
-      from: 'onboarding@resend.dev',
-      to: email,
-      subject: 'Reset your CMRG password',
-      html: `
-        <p>Hi ${user.name || ''},</p>
-        <p>Click the link below to reset your CMRG Data App password. This link expires in 1 hour.</p>
-        <p><a href="${resetUrl}">${resetUrl}</a></p>
-        <p>If you didn't request this, you can safely ignore this email.</p>
-      `,
-    });
-
-    res.json({ message: 'A reset link has been sent to your email.' });
-  } catch (err) {
-    console.error('Forgot password error:', err);
-    res.status(500).json({ error: 'Something went wrong. Please try again.' });
-  }
-});
-
-router.post('/reset-password', async (req, res) => {
-  try {
-    const { token, password } = req.body;
-    if (!token || !password) {
-      return res.status(400).json({ error: 'Token and new password are required' });
-    }
-
-    const result = await pool.query(
-      'SELECT * FROM users WHERE reset_token = $1 AND reset_token_expires > NOW()',
-      [token]
-    );
-    const user = result.rows[0];
-    if (!user) {
-      return res.status(400).json({ error: 'This reset link is invalid or has expired.' });
-    }
-
-    const password_hash = await bcrypt.hash(password, 10);
-    await pool.query(
-      'UPDATE users SET password_hash = $1, reset_token = NULL, reset_token_expires = NULL WHERE id = $2',
-      [password_hash, user.id]
-    );
-
-    res.json({ message: 'Password updated successfully.' });
-  } catch (err) {
-    console.error('Reset password error:', err);
-    res.status(500).json({ error: 'Something went wrong. Please try again.' });
-  }
-});
+// ==============================
+// ZOHO LOGIN
+// ==============================
 
 router.get('/zoho/login', (req, res) => {
-  const params = new URLSearchParams({
-    scope: 'AaaServer.profile.Read',
-    client_id: process.env.ZOHO_CLIENT_ID as string,
-    response_type: 'code',
-    redirect_uri: process.env.ZOHO_REDIRECT_URI as string,
-    access_type: 'online',
-  });
-  res.redirect(`https://accounts.zoho.com/oauth/v2/auth?${params.toString()}`);
+  try {
+    const clientId = process.env.ZOHO_CLIENT_ID;
+    const redirectUri = process.env.ZOHO_REDIRECT_URI;
+
+    if (!clientId || !redirectUri) {
+      console.error('Missing Zoho environment variables');
+      return res.status(500).json({
+        error: 'Zoho authentication is not configured',
+      });
+    }
+
+    const params = new URLSearchParams({
+      scope: 'zohoprofile.userinfo.read',
+      client_id: clientId,
+      response_type: 'code',
+      redirect_uri: redirectUri,
+      access_type: 'online',
+    });
+
+    const zohoAuthUrl =
+      `https://accounts.zoho.com/oauth/v2/auth?${params.toString()}`;
+
+    console.log('Redirecting to Zoho OAuth');
+
+    return res.redirect(zohoAuthUrl);
+  } catch (error) {
+    console.error('Zoho login error:', error);
+
+    return res.status(500).json({
+      error: 'Unable to start Zoho authentication',
+    });
+  }
 });
+
+
+// ==============================
+// ZOHO CALLBACK
+// ==============================
 
 router.get('/zoho/callback', async (req, res) => {
   try {
-    const code = req.query.code as string;
-    if (!code) {
-      return res.redirect(`${process.env.FRONTEND_URL}/login?error=zoho_denied`);
+    const code = req.query.code as string | undefined;
+    const error = req.query.error as string | undefined;
+
+    const frontendUrl = process.env.FRONTEND_URL;
+    const clientId = process.env.ZOHO_CLIENT_ID;
+    const clientSecret = process.env.ZOHO_CLIENT_SECRET;
+    const redirectUri = process.env.ZOHO_REDIRECT_URI;
+    const jwtSecret = process.env.JWT_SECRET;
+
+    // --------------------------------
+    // Validate environment variables
+    // --------------------------------
+
+    if (
+      !frontendUrl ||
+      !clientId ||
+      !clientSecret ||
+      !redirectUri ||
+      !jwtSecret
+    ) {
+      console.error('Missing required authentication environment variables');
+
+      return res.redirect(
+        `${frontendUrl || 'https://cmrg-frontend.vercel.app'}/login?error=zoho_config`
+      );
     }
 
-    // Exchange the authorization code for an access token
+    // --------------------------------
+    // User cancelled/denied Zoho login
+    // --------------------------------
+
+    if (error) {
+      console.error('Zoho authorization error:', error);
+
+      return res.redirect(
+        `${frontendUrl}/login?error=zoho_denied`
+      );
+    }
+
+    // --------------------------------
+    // Make sure authorization code exists
+    // --------------------------------
+
+    if (!code) {
+      console.error('No Zoho authorization code received');
+
+      return res.redirect(
+        `${frontendUrl}/login?error=zoho_denied`
+      );
+    }
+
+    // --------------------------------
+    // Exchange authorization code
+    // for Zoho access token
+    // --------------------------------
+
     const tokenParams = new URLSearchParams({
       grant_type: 'authorization_code',
-      client_id: process.env.ZOHO_CLIENT_ID as string,
-      client_secret: process.env.ZOHO_CLIENT_SECRET as string,
-      redirect_uri: process.env.ZOHO_REDIRECT_URI as string,
+      client_id: clientId,
+      client_secret: clientSecret,
+      redirect_uri: redirectUri,
       code,
     });
 
-    const tokenRes = await fetch('https://accounts.zoho.com/oauth/v2/token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: tokenParams.toString(),
-    });
-    const tokenData = await tokenRes.json();
-
-    if (!tokenData.access_token) {
-      console.error('Zoho token exchange failed:', tokenData);
-      return res.redirect(`${process.env.FRONTEND_URL}/login?error=zoho_failed`);
-    }
-
-    // Use the access token to fetch the user's Zoho profile (name + email)
-    const profileRes = await fetch('https://accounts.zoho.com/oauth/user/info', {
-      headers: { Authorization: `Zoho-oauthtoken ${tokenData.access_token}` },
-    });
-    const profile = await profileRes.json();
-    const email = (profile.Email || '').trim().toLowerCase();
-
-    if (!email) {
-      return res.redirect(`${process.env.FRONTEND_URL}/login?error=zoho_no_email`);
-    }
-
-    // Only log in users who already have a CMRG account with this email —
-    // does NOT auto-create accounts, since self-registration policy is
-    // still an open question with the client.
-    const result = await pool.query('SELECT * FROM users WHERE LOWER(email) = $1', [email]);
-    const user = result.rows[0];
-
-    if (!user) {
-      return res.redirect(`${process.env.FRONTEND_URL}/login?error=zoho_no_account`);
-    }
-
-    const jwtToken = jwt.sign(
-      { id: user.id, role: user.role, org_id: user.org_id },
-      process.env.JWT_SECRET as string,
-      { expiresIn: '7d' }
+    const tokenRes = await fetch(
+      'https://accounts.zoho.com/oauth/v2/token',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: tokenParams.toString(),
+      }
     );
 
-    res.redirect(`${process.env.FRONTEND_URL}/zoho-callback?token=${jwtToken}`);
-  } catch (err) {
-    console.error('Zoho callback error:', err);
-    res.redirect(`${process.env.FRONTEND_URL}/login?error=zoho_failed`);
+    const tokenData = await tokenRes.json();
+
+    console.log('Zoho token response:', {
+      success: !!tokenData.access_token,
+      hasRefreshToken: !!tokenData.refresh_token,
+      error: tokenData.error,
+    });
+
+    if (!tokenRes.ok || !tokenData.access_token) {
+      console.error(
+        'Zoho token exchange failed:',
+        tokenData
+      );
+
+      return res.redirect(
+        `${frontendUrl}/login?error=zoho_failed`
+      );
+    }
+
+    // --------------------------------
+    // Get Zoho user profile
+    // --------------------------------
+
+    const profileRes = await fetch(
+      'https://profile.zoho.com/api/v1/user/self/profile',
+      {
+        method: 'GET',
+        headers: {
+          Authorization: `Zoho-oauthtoken ${tokenData.access_token}`,
+        },
+      }
+    );
+
+    const profile = await profileRes.json();
+
+    console.log('Zoho profile response:', profile);
+
+    if (!profileRes.ok) {
+      console.error(
+        'Failed to retrieve Zoho profile:',
+        profile
+      );
+
+      return res.redirect(
+        `${frontendUrl}/login?error=zoho_profile_failed`
+      );
+    }
+
+    // --------------------------------
+    // Extract email
+    // --------------------------------
+
+    const email = (
+      profile.email ||
+      profile.Email ||
+      profile.email_id ||
+      profile.EmailID ||
+      ''
+    )
+      .trim()
+      .toLowerCase();
+
+    console.log('Zoho account email:', email);
+
+    if (!email) {
+      console.error(
+        'Zoho profile did not contain an email address'
+      );
+
+      return res.redirect(
+        `${frontendUrl}/login?error=zoho_no_email`
+      );
+    }
+
+    // --------------------------------
+    // Find user in CMRG database
+    // --------------------------------
+
+    const result = await pool.query(
+      `
+      SELECT *
+      FROM users
+      WHERE LOWER(email) = $1
+      LIMIT 1
+      `,
+      [email]
+    );
+
+    const user = result.rows[0];
+
+    console.log(
+      'CMRG user found:',
+      !!user
+    );
+
+    // --------------------------------
+    // Zoho account must already exist
+    // in CMRG
+    // --------------------------------
+
+    if (!user) {
+      console.error(
+        `No CMRG account found for Zoho email: ${email}`
+      );
+
+      return res.redirect(
+        `${frontendUrl}/login?error=zoho_no_account`
+      );
+    }
+
+    // --------------------------------
+    // Admin-only protection
+    // --------------------------------
+
+    if (user.role !== 'admin') {
+      console.error(
+        `Non-admin attempted web login through Zoho: ${email}`
+      );
+
+      return res.redirect(
+        `${frontendUrl}/login?error=enumerator_web`
+      );
+    }
+
+    // --------------------------------
+    // Create CMRG JWT
+    // --------------------------------
+
+    const jwtToken = jwt.sign(
+      {
+        id: user.id,
+        role: user.role,
+        org_id: user.org_id,
+      },
+      jwtSecret,
+      {
+        expiresIn: '7d',
+      }
+    );
+
+    console.log(
+      `Zoho login successful for: ${email}`
+    );
+
+    // --------------------------------
+    // Send user back to frontend
+    // --------------------------------
+
+    return res.redirect(
+      `${frontendUrl}/zoho-callback?token=${encodeURIComponent(jwtToken)}`
+    );
+
+  } catch (error) {
+    console.error(
+      'Zoho callback error:',
+      error
+    );
+
+    const frontendUrl =
+      process.env.FRONTEND_URL ||
+      'https://cmrg-frontend.vercel.app';
+
+    return res.redirect(
+      `${frontendUrl}/login?error=zoho_failed`
+    );
   }
 });
-
-export default router;
