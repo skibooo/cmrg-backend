@@ -15,5 +15,6 @@
     "skipLibCheck": true,
     "moduleDetection": "force",
     "forceConsistentCasingInFileNames": true
-  }
+  },
+  "exclude": ["scripts", "node_modules", "dist"]
 }

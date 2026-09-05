@@ -17,7 +17,18 @@ router.get('/', requireAuth, async (req: AuthRequest, res) => {
 
 router.post('/', requireAuth, async (req: AuthRequest, res) => {
   try {
+    if (req.user?.role !== 'admin') {
+      return res.status(403).json({ error: 'Only admins can create new users' });
+    }
+
     const { name, email, password, role } = req.body;
+    if (!name || !email || !password || !role) {
+      return res.status(400).json({ error: 'Name, email, password, and role are required' });
+    }
+    if (!['admin', 'enumerator'].includes(role)) {
+      return res.status(400).json({ error: 'Invalid role' });
+    }
+
     const password_hash = await bcrypt.hash(password, 10);
     const result = await pool.query(
       'INSERT INTO users (org_id, name, email, password_hash, role) VALUES ($1, $2, $3, $4, $5) RETURNING id, name, email, role, created_at',

@@ -3,11 +3,19 @@ import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { Resend } from 'resend';
+import rateLimit from 'express-rate-limit';
 import { pool } from '../db';
 
 const router = Router();
 const resend = new Resend(process.env.RESEND_API_KEY);
-console.log('RESEND_API_KEY loaded:', process.env.RESEND_API_KEY ? `${process.env.RESEND_API_KEY.slice(0, 6)}...` : 'MISSING');
+
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 10, // limit each IP to 10 login attempts per window
+  message: { error: 'Too many login attempts. Please try again in 15 minutes.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
 
 router.post('/register', async (req, res) => {
   try {
@@ -24,13 +32,10 @@ router.post('/register', async (req, res) => {
   }
 });
 
-router.post('/login', async (req, res) => {
+router.post('/login', loginLimiter as any, async (req, res) => {
   try {
     const email = (req.body.email || '').trim().toLowerCase();
     const password = req.body.password || '';
-
-    // TEMPORARY diagnostic — remove once mobile login is confirmed working
-    console.log('Login attempt:', JSON.stringify({ email, passwordLength: password.length }));
 
     const result = await pool.query('SELECT * FROM users WHERE LOWER(email) = $1', [email]);
     const user = result.rows[0];
@@ -51,7 +56,7 @@ router.post('/login', async (req, res) => {
   }
 });
 
-router.post('/forgot-password', async (req, res) => {
+router.post('/forgot-password', loginLimiter as any, async (req, res) => {
   try {
     const email = (req.body.email || '').trim().toLowerCase();
     if (!email) return res.status(400).json({ error: 'Email is required' });
@@ -76,7 +81,7 @@ router.post('/forgot-password', async (req, res) => {
 
     const resetUrl = `${process.env.FRONTEND_URL}/reset-password?token=${token}`;
 
-        const emailResult = await resend.emails.send({
+    await resend.emails.send({
       from: 'onboarding@resend.dev',
       to: email,
       subject: 'Reset your CMRG password',
@@ -87,7 +92,6 @@ router.post('/forgot-password', async (req, res) => {
         <p>If you didn't request this, you can safely ignore this email.</p>
       `,
     });
-    console.log('Resend response:', JSON.stringify(emailResult));
 
     res.json({ message: 'A reset link has been sent to your email.' });
   } catch (err) {
@@ -122,6 +126,79 @@ router.post('/reset-password', async (req, res) => {
   } catch (err) {
     console.error('Reset password error:', err);
     res.status(500).json({ error: 'Something went wrong. Please try again.' });
+  }
+});
+
+router.get('/zoho/login', (req, res) => {
+  const params = new URLSearchParams({
+    scope: 'AaaServer.profile.Read',
+    client_id: process.env.ZOHO_CLIENT_ID as string,
+    response_type: 'code',
+    redirect_uri: process.env.ZOHO_REDIRECT_URI as string,
+    access_type: 'online',
+  });
+  res.redirect(`https://accounts.zoho.com/oauth/v2/auth?${params.toString()}`);
+});
+
+router.get('/zoho/callback', async (req, res) => {
+  try {
+    const code = req.query.code as string;
+    if (!code) {
+      return res.redirect(`${process.env.FRONTEND_URL}/login?error=zoho_denied`);
+    }
+
+    // Exchange the authorization code for an access token
+    const tokenParams = new URLSearchParams({
+      grant_type: 'authorization_code',
+      client_id: process.env.ZOHO_CLIENT_ID as string,
+      client_secret: process.env.ZOHO_CLIENT_SECRET as string,
+      redirect_uri: process.env.ZOHO_REDIRECT_URI as string,
+      code,
+    });
+
+    const tokenRes = await fetch('https://accounts.zoho.com/oauth/v2/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: tokenParams.toString(),
+    });
+    const tokenData = await tokenRes.json();
+
+    if (!tokenData.access_token) {
+      console.error('Zoho token exchange failed:', tokenData);
+      return res.redirect(`${process.env.FRONTEND_URL}/login?error=zoho_failed`);
+    }
+
+    // Use the access token to fetch the user's Zoho profile (name + email)
+    const profileRes = await fetch('https://accounts.zoho.com/oauth/user/info', {
+      headers: { Authorization: `Zoho-oauthtoken ${tokenData.access_token}` },
+    });
+    const profile = await profileRes.json();
+    const email = (profile.Email || '').trim().toLowerCase();
+
+    if (!email) {
+      return res.redirect(`${process.env.FRONTEND_URL}/login?error=zoho_no_email`);
+    }
+
+    // Only log in users who already have a CMRG account with this email —
+    // does NOT auto-create accounts, since self-registration policy is
+    // still an open question with the client.
+    const result = await pool.query('SELECT * FROM users WHERE LOWER(email) = $1', [email]);
+    const user = result.rows[0];
+
+    if (!user) {
+      return res.redirect(`${process.env.FRONTEND_URL}/login?error=zoho_no_account`);
+    }
+
+    const jwtToken = jwt.sign(
+      { id: user.id, role: user.role, org_id: user.org_id },
+      process.env.JWT_SECRET as string,
+      { expiresIn: '7d' }
+    );
+
+    res.redirect(`${process.env.FRONTEND_URL}/zoho-callback?token=${jwtToken}`);
+  } catch (err) {
+    console.error('Zoho callback error:', err);
+    res.redirect(`${process.env.FRONTEND_URL}/login?error=zoho_failed`);
   }
 });
 
